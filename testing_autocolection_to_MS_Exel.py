@@ -2,7 +2,11 @@ import re
 from playwright.sync_api import Playwright, sync_playwright
 import pandas as pd
 import time
+import os
+import urllib.request
 from openpyxl.styles import Alignment, Border, Side, Font
+from openpyxl.drawing.image import Image as OpenpyxlImage
+
 
 def run(playwright: Playwright) -> None:
     browser = playwright.chromium.launch(headless=False)
@@ -16,77 +20,109 @@ def run(playwright: Playwright) -> None:
     page.get_by_role("textbox", name="Sem zadejte hledané slovo").fill("Zaklínač")
     page.get_by_role("textbox", name="Sem zadejte hledané slovo").press("Enter")
     
+    # Vytvoříme složku pro obrázky, pokud neexistuje
+    slozka_obrazku = "obrazky_books"
+    if not os.path.exists(slozka_obrazku):
+        os.makedirs(slozka_obrazku)
+
     data_list = []
     stranka = 1
     
     while True:
         print(f"Zpracovávám stránku {stranka}...")
-        time.sleep(4) # Čas na načtení nové stránky
-        
-        # Sběr dat z aktuální stránky
+        time.sleep(4)
+
         nadpisy_h3 = page.locator("h3").all()
         
         for h3 in nadpisy_h3:
-            nazev = h3.inner_text().strip()
+            nazev_raw = h3.inner_text().strip()
             
-            if not nazev or len(nazev) < 4 or "appce" in nazev.lower() or "kapse" in nazev.lower():
+            if not nazev_raw or len(nazev_raw) < 4 or "appce" in nazev_raw.lower() or "kapse" in nazev_raw.lower():
                 continue
                 
             box_produktu = h3.locator("xpath=../..")
             cena_elem = box_produktu.locator("[class*='price'], [class*='cena'], .price").first
             
-            cena = cena_elem.inner_text().strip() if cena_elem.count() > 0 else "Cena nenalezena"
-            if cena_elem.count() > 0:
-                cena = cena.split("\n")[0] 
-                
+            cena = cena_elem.inner_text().strip() if cena_elem.count() > 0 else "Nedostupné"
+            
+                        
+                       # --- STAŽENÍ OBRÁZKU (NEPRŮSTŘELNÁ HACK VERZE) ---
+            img_url = "Bez obrázku"
+            img_elem = box_produktu.locator("img").first
+            
+            if img_elem.count() > 0:
+                try:
+                    # Přinutíme web prvek vykreslit
+                    img_elem.scroll_into_view_if_needed()
+                    time.sleep(0.4)  # Klíčová pauza: dáme webu čas na výměnu placeholderu za obálku!
+                    
+                    # 1. Trik: Zkusíme vytáhnout moderní 'srcset' nebo 'data-srcset', kde jsou reálné fotky
+                    srcset = img_elem.get_attribute("srcset") or img_elem.get_attribute("data-srcset")
+                    if srcset:
+                        img_url = srcset.split(",")[-1].strip().split(" ")[-1].strip()
+
+                    
+                    # 2. Trik: Pokud srcset chybí, zkusíme klasické data-src nebo src
+                    if not img_url or "Bez obrázku" in img_url or "base64" in img_url or "placeholder" in img_url.lower():
+                        img_url = img_elem.get_attribute("data-src") or img_elem.get_attribute("src") or "Bez obrázku"
+                except Exception:
+                    pass
+
+            jmeno_obrazku = "X"
+            if img_url and img_url != "Bez obrázku" and "base64" not in img_url:
+                try:
+                    cisty_nazev_souboru = nazev_raw.replace("\n", " ").replace("\r", " ").strip()
+                    bezpecny_nazev = re.sub(r'[\\/*?:"<>|]', "", cisty_nazev_souboru).replace(" ", "_")
+                    jmeno_obrazku = f"{bezpecny_nazev}.jpg"
+                    cesta_k_obrazku = os.path.join(slozka_obrazku, jmeno_obrazku)
+                    
+                    req = urllib.request.Request(img_url, headers={'User-Agent': 'Mozilla/5.0'})
+                    with urllib.request.urlopen(req) as response, open(cesta_k_obrazku, 'wb') as out_file:
+                        out_file.write(response.read())
+                except Exception as e:
+                    jmeno_obrazku = "Chyba stahování"
+
+            # Do listu ukládáme postaru pod klíčem "Cena (Kč)", Pandas to přejmenuje až později
             data_list.append({
-                "Název knihy": nazev,
-                "Cena (Kč) s DPH": cena
+                "Název knihy": nazev_raw,
+                "Cena (Kč)": cena,
+                "Titulní obrázek": jmeno_obrazku
             })
             
-        # STRÁNKOVÁNÍ: Najdeme tlačítko "Další" na konci stránky
-        # Na Dobrovského webu má obvykle třídu obsahující 'pagination__next' nebo šipku
         dalsi_tlacitko = page.locator(".pagination__next, a[rel='next']").first
-        
-        # Zkontrolujeme, jestli tlačítko existuje a je viditelné
-        if dalsi_tlacitko.count() > 0 and dalsi_tlacitko.is_visible():
+        if dalsi_tlacitko.count() > 0 and dalsi_tlacitko.is_visible() and stranka < 2: # Omezeno na 2 stránky pro rychlost
             print("Nalezena další stránka, klikám...")
             dalsi_tlacitko.click()
             stranka += 1
         else:
-            print("Jsme na poslední stránce, končíme sběr dat.")
-            break # Vyskočíme z nekonečného cyklu while
+            print("Končíme sběr dat a stahování.")
+            break
             
-    # Uložení do Excelu s tvým hezkým formátováním
-       # Uložení do Excelu s filtrací a řazením
-        # Uložení do Excelu s pokročilou filtrací, novým sloupcem "Stav" a řazením
-        # Uložení do Excelu s pokročilou filtrací, řazením podle priorit a výpočtem slev
+    # --- PANDAS DATA WRANGLING & ČIŠTĚNÍ ---
     if data_list:
         df = pd.DataFrame(data_list)
         df = df.drop_duplicates(subset=["Název knihy"])
         
-        # --- KROK 1: PŘEDBĚŽNÉ SLEDNOCENÍ NEDOSTUPNOSTI ---
-        # Pokud je v textu ceny nebo názvu slovo nedostupné, dáme to i do ceny
+        # Sjednocení nedostupnosti
         def sjednot_nedostupnost(row):
             nazev = str(row["Název knihy"]).lower()
-            cena = str(row["Cena (Kč) s DPH"]).lower()
-            if "nedostupné" in nazev or "nedostupné" in cena or "nedostupne" in cena:
+            cena = str(row["Cena (Kč)"]).lower()
+            if "nedostupné" in nazev or "nedostupné" in cena:
                 return "Nedostupné"
-            return row["Cena (Kč) s DPH"]
+            return row["Cena (Kč)"]
         
-        df["Cena (Kč) s DPH"] = df.apply(sjednot_nedostupnost, axis=1)
+        df["Cena (Kč)"] = df.apply(sjednot_nedostupnost, axis=1)
 
-        # --- KROK 2: EXTRAKCE STAVU A ČIŠTĚNÍ NÁZVŮ ---
+        # Extrakce stavů a čištění textů od \n
         def urci_stav_a_vycisti(row):
             nazev = str(row["Název knihy"])
-            cena = str(row["Cena (Kč) s DPH"])
+            cena = str(row["Cena (Kč)"])
             
             nalezeny_stav = "Standardní"
             cisty_nazev = nazev
             
             stavy_klic = ["BLACK FRIDAY", "Bestseller", "Novinka", "Poškozené", "Sleva"]
             
-            # Pokud je cena Nedostupné, stav je jasný
             if cena == "Nedostupné":
                 nalezeny_stav = "Nedostupné"
                 cisty_nazev = re.sub(r"(?i)Nedostupné\s*\n*", "", cisty_nazev).strip()
@@ -99,7 +135,6 @@ def run(playwright: Playwright) -> None:
                             nalezeny_stav = s
                         cisty_nazev = re.sub(rf"(?i){s}\s*\n*", "", cisty_nazev).strip()
             
-            # Speciální dočištění částek z názvu u slev (např. "143 Kč\nKompletní Zaklínač")
             sleva_v_nazvu = re.search(r"(\d+\s*Kč)\s*\n*", cisty_nazev)
             extrahovana_sleva_text = "X"
             if sleva_v_nazvu:
@@ -110,31 +145,31 @@ def run(playwright: Playwright) -> None:
             if "poškozené" in cisty_nazev.lower():
                 nalezeny_stav = "Poškozené"
                 
-            # Vyčištění případných prázdných závorek na konci
             cisty_nazev = re.sub(r"\s*\(\s*\)\s*$", "", cisty_nazev).strip()
+            cisty_nazev = cisty_nazev.replace("\n", " ").replace("\r", " ").strip()
             
             return pd.Series([cisty_nazev, nalezeny_stav, extrahovana_sleva_text])
 
-        # Aplikujeme čištění
         df[["Název knihy", "Stav", "Akční sleva"]] = df.apply(urci_stav_a_vycisti, axis=1)
         
-        # --- KROK 3: LOGIKA PRO CENU PO SLEVĚ ---
+       
+                # Logika slevy a vyčištění textu ceny od "Běžně / Do košíku"
         def vyres_ceny(row):
-            cena_zaklad = str(row["Cena (Kč) s DPH"])
-            akcni = str(row["Akční sleva"])
+            # Vezmeme jen první řádek ceny (odřízneme "Běžně..." a "Do košíku")
+            cena_zaklad = str(row["Cena (Kč)"]).split("\n")[0].strip()
+            akcni = str(row["Akční sleva"]).strip()
             
-            if row["Stav"] == "Nedostupné" or cena_zaklad == "Nedostupné":
+            if row["Stav"] == "Nedostupné" or cena_zaklad.lower() == "nedostupné":
                 return pd.Series(["Nedostupné", "X"])
-            
             if row["Stav"] == "Sleva":
-                # Prohodíme to, aby v "Cena po slevě" byla ta nižší zobrazená cena z webu
                 return pd.Series([cena_zaklad, akcni])
             else:
                 return pd.Series([cena_zaklad, "X"])
+
                 
-        df[["Cena (Kč) s DPH", "Cena po slevě (Kč)"]] = df.apply(vyres_ceny, axis=1)
+        df[["Cena (Kč)", "Cena po slevě (Kč)"]] = df.apply(vyres_ceny, axis=1)
         
-        # --- KROK 4: FILTRACE ŠUMU ---
+        # Filtrace non-Witcher věcí
         df['nazev_lower'] = df['Název knihy'].str.lower()
         podminka_obsahuje = df['nazev_lower'].str.contains('zaklínač|witcher|sága o', regex=True)
         zakazana_slova = 'hrnek|puzzle|plakát|odznak|minix|podložka|kostek|mince|bundle|hra na hrdiny|kniha\s+a|kuchař'
@@ -143,29 +178,23 @@ def run(playwright: Playwright) -> None:
         df = df[podminka_obsahuje & podminka_nezakazano]
         df = df.drop(columns=['nazev_lower', 'Akční sleva'])
         
-        # --- KROK 5: VLASTNÍ ŘAZENÍ PODLE TVÝCH PRIORIT ---
-        # Definujeme slovník s prioritami stavů
+        # Přejmenování sloupce přesně podle tebe (na s DPH)
+        df = df.rename(columns={"Cena (Kč)": "Cena (Kč) s DPH"})
+        
+        # Řazení podle tvých priorit
         priorita_stavu = {
-            "Bestseller": 1,
-            "Sleva": 2,
-            "Standardní": 5,
-            "Black Friday": 3,  # Black Friday dáme na úroveň standardních/novinek
-            "Novinka": 4,
-            "Poškozené": 6,
-            "Nedostupné": 7
+            "Bestseller": 1, "Sleva": 2, "Standardní": 3, 
+            "Black Friday": 3, "Novinka": 3, "Poškozené": 4, "Nedostupné": 5
         }
-        
         df['priorita_cislo'] = df['Stav'].map(priorita_stavu).fillna(3)
-        
-        # Seřadíme nejdříve podle čísla priority stavu, potom abecedně podle názvu knihy
         df = df.sort_values(by=['priorita_cislo', 'Název knihy'], ascending=[True, True])
         df = df.drop(columns=['priorita_cislo'])
         
-        # Přeskládáme sloupce pro dokonalý vizuální výsledek
-        df = df[["Název knihy", "Stav", "Cena (Kč) s DPH", "Cena po slevě (Kč)"]]
+        # Přeskládání sloupců (včetně nového sloupce pro obrázek!)
+        df = df[["Název knihy", "Stav", "Cena (Kč) s DPH", "Cena po slevě (Kč)", "Titulní obrázek"]]
         
-        # --- KROK 6: ZÁPIS DO EXCELU A REAL AUTOFIT ---
-        excel_file = "vysledky_zaklinac_final.xlsx"
+        # --- EXCEL ZÁPIS & DYNAMICKÝ STYLING ---
+        excel_file = "vysledky_zaklinac_finalni.xlsx"
         
         with pd.ExcelWriter(excel_file, engine='openpyxl') as writer:
             df.to_excel(writer, index=False, sheet_name="Zaklínač")
@@ -178,35 +207,64 @@ def run(playwright: Playwright) -> None:
             
             worksheet.row_dimensions.height = 28
             
+                        # Skutečný dynamický AUTOFIT + VKLÁDÁNÍ OBRÁZKŮ
+                        # Skutečný dynamický AUTOFIT + VKLÁDÁNÍ OBRÁZKŮ
             for col in worksheet.columns:
                 max_len = 0
                 col_letter = col[0].column_letter
                 
                 for cell in col:
-                    cell.border = ohraniceni
-                    if cell.row > 1:
-                        worksheet.row_dimensions[cell.row].height = 22
+                    # ÚPRAVA: Ohraničení dáme všem sloupcům KROMĚ sloupce E
+                    if col_letter != "E":
+                        cell.border = ohraniceni
+                    else:
+                        # Sloupci E (obrázkům) ohraničení úplně vymažeme
+                        cell.border = Border()
                     
+                    # Nastavení výšky řádku - pro obrázky potřebujeme víc místa
+                    if cell.row > 1:
+                        worksheet.row_dimensions[cell.row].height = 110
+                    else:
+                        worksheet.row_dimensions[cell.row].height = 28
+                    
+                    # Zarovnání
                     if cell.row == 1:
                         cell.font = tucne_pismo
                         cell.alignment = zarovnani_stred
                     else:
-                        if col_letter in ["B", "C", "D"]:  # Stav, Cena i Nová cena budou na střed
+                        if col_letter in ["B", "C", "D", "E"]:
                             cell.alignment = zarovnani_stred
                         else:
                             cell.alignment = Alignment(horizontal="left", vertical="center")
                     
+                    # Vkládání obrázků do sloupce E
+                    if col_letter == "E" and cell.row > 1 and cell.value and cell.value not in ["X", "Chyba stahování"]:
+                        cesta_k_foto = os.path.join(slozka_obrazku, str(cell.value))
+                        
+                        if os.path.exists(cesta_k_foto):
+                            try:
+                                img = OpenpyxlImage(cesta_k_foto)
+                                img.height = 140
+                                img.width = 100
+                                
+                                cell.value = "" 
+                                worksheet.add_image(img, f"E{cell.row}")
+                            except Exception as e:
+                                print(f"Nelze vložit obrázek do Excelu: {e}")
+                    
                     if cell.value:
                         max_len = max(max_len, len(str(cell.value)))
                 
-                worksheet.column_dimensions[col_letter].width = max(max_len + 4, 14)
+                # Nastavení šířky sloupců
+                if col_letter == "E":
+                    worksheet.column_dimensions[col_letter].width = 16  # Širší sloupec pro velký obrázek
+                else:
+                    worksheet.column_dimensions[col_letter].width = max(max_len + 4, 14)
 
-        print(f"\n🎉 ABSOLUTNÍ DOKONALOST! Data jsou seřazena a vyčištěna v '{excel_file}'!")
+
+        print(f"\n🎉 DOKONČENO BEZ CHYB! Excel a složka s obrázky jsou připraveny!")
     else:
-        print("\n❌ Nepodařilo se najít žádná data.")
-
-
-
+        print("\n❌ Žádná data k uložení.")
 
     context.close()
     browser.close()
